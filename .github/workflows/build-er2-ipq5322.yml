@@ -1,0 +1,116 @@
+# 基于Fork官方仓库：京东云ER2（IPQ5322）ImmortalWrt编译脚本（带iStore）
+name: Build ER2-IPQ5322 ImmortalWrt (iStore)
+
+# 触发方式：手动触发（推荐）+ 修改.config自动触发
+on:
+  workflow_dispatch:  # 手动触发（新手可控）
+  push:
+    branches: [ master ]  # 官方仓库默认分支是master，需匹配
+    paths: [ '.config' ]  # 仅修改根目录.config时自动编译
+
+# 运行权限（必须配置，否则无法上传固件）
+permissions:
+  contents: write
+
+jobs:
+  build-er2-firmware:
+    runs-on: ubuntu-22.04  # ImmortalWrt官方推荐编译环境
+    concurrency:
+      group: ${{ github.ref }}
+      cancel-in-progress: true  # 取消重复编译任务
+
+    steps:
+      # 步骤1：拉取你Fork的官方仓库源码（核心！直接用仓库本身的代码）
+      - name: Checkout Forked ImmortalWrt Source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          ref: master  # 匹配官方仓库默认分支（master）
+
+      # 步骤2：安装IPQ5322编译必需依赖（适配QWRT版本）
+      - name: Install Dependencies for IPQ5322
+        run: |
+          sudo apt update -y && sudo apt full-upgrade -y
+          sudo apt install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+          gettext git libncurses5-dev libssl-dev python3-distutils rsync unzip zlib1g-dev file wget \
+          libelf-dev liblzma-dev swig upx-ucl antlr3 gperf curl libc6-dev-i386 lib32gcc-s1 \
+          lib32stdc++6 lib32z1  # IPQ5322必需的32位依赖
+          sudo apt autoremove -y && sudo apt clean -y
+
+      # 步骤3：配置编译缓存（二次编译提速80%，适配官方仓库路径）
+      - name: Cache Compilation Files
+        uses: actions/cache@v3
+        with:
+          # 路径改为仓库根目录（Fork仓库本身就是源码目录）
+          path: |
+            ./dl          # 缓存下载的源码包
+            ./staging_dir # 缓存编译工具链
+            ./toolchain
+            ./build_dir   # 缓存编译中间文件
+            ~/.ccache
+          key: ${{ runner.os }}-ipq5322-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-ipq5322-
+
+      # 步骤4：合并QWRT的IPQ5322适配代码（适配京东云ER2）
+      - name: Merge QWRT IPQ5322 Patch
+        run: |
+          # 添加QWRT远程仓库，拉取IPQ5322适配补丁
+          git remote add qwrt https://github.com/qwrt-project/qwrt.git
+          git fetch qwrt
+          # 合并QWRT中IPQ5322相关适配（仅合并京东云ER2所需代码）
+          git cherry-pick qwrt/main --no-commit -X theirs  # 自动解决冲突
+          # 确保IPQ5322机型配置文件存在
+          mkdir -p ./target/linux/ipq50xx/generic/
+          wget -O ./target/linux/ipq50xx/generic/base-files/etc/board.d/02_network \
+          https://raw.githubusercontent.com/qwrt-project/qwrt/main/target/linux/ipq50xx/generic/base-files/etc/board.d/02_network
+          wget -O ./target/linux/ipq50xx/generic/config-5.15 \
+          https://raw.githubusercontent.com/qwrt-project/qwrt/main/target/linux/ipq50xx/generic/config-5.15
+
+      # 步骤5：集成iStore插件商店（核心需求）
+      - name: Integrate iStore Plugin Store
+        run: |
+          # 克隆iStore组件到官方仓库的package目录
+          git clone --depth=1 https://github.com/linkease/istore.git package/istore
+          git clone --depth=1 https://github.com/linkease/istore-ui.git package/istore-ui
+          # 更新并安装feeds，确保iStore依赖生效
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          # 预启用iStore配置（后续.config会覆盖，双重保障）
+          echo 'CONFIG_PACKAGE_luci-app-store=y' >> .config
+          echo 'CONFIG_PACKAGE_istore-core=y' >> .config
+
+      # 步骤6：适配京东云ER2（IPQ5322）固件瘦身
+      - name: Slim ER2 Firmware
+        run: |
+          # 关闭IPv6（ER2默认无需，需开启则注释此行）
+          sed -i 's/CONFIG_IPV6=y/# CONFIG_IPV6 is not set/' .config
+          # 仅保留中英语言包，适配IPQ5322存储限制
+          sed -i 's/CONFIG_LUCI_LANG_.*=y//g' .config
+          echo 'CONFIG_LUCI_LANG_zh-cn=y' >> .config
+          echo 'CONFIG_LUCI_LANG_en=y' >> .config
+          # 关闭调试功能，避免内存溢出
+          sed -i 's/CONFIG_DEBUG=y/# CONFIG_DEBUG is not set/' .config
+          sed -i 's/CONFIG_KERNEL_DEBUG=y/# CONFIG_KERNEL_DEBUG is not set/' .config
+
+      # 步骤7：加载京东云ER2（IPQ5322）专属.config
+      - name: Load ER2 Custom Config
+        run: |
+          # 确保根目录的.config生效（Fork仓库根目录的.config）
+          make defconfig  # 自动补全IPQ5322依赖，适配官方仓库
+
+      # 步骤8：编译固件（适配IPQ5322线程/内存限制）
+      - name: Build ER2 Firmware
+        run: |
+          # IPQ5322编译建议4线程，避免内存溢出（官方仓库根目录编译）
+          make -j4 || make -j1 V=s  # 失败则单线程排错，输出详细日志
+
+      # 步骤9：上传编译好的固件（可下载）
+      - name: Upload ER2 Firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: ER2-IPQ5322-ImmortalWrt-iStore-${{ github.run_id }}
+          path: |
+            ./bin/targets/**/*.bin
+            ./bin/targets/**/*.img
+          retention-days: 30  # 固件保留30天
